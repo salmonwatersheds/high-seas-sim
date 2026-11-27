@@ -31,19 +31,19 @@ set.seed(2)
 # 1. Scenario and file paths ---------------------------------------------
 
 k         <- "base"                                    # scenario label used in output names
-fit.file  <- here("output", "stan_fit.rds")            # stanfit object from hbm_stat_inter.stan
+#fit.file  <- here("output", "stan_fit.rds")            # stanfit object from hbm_stat_inter.stan
 out.dir   <- here("output")
 dir.create(out.dir, showWarnings = FALSE, recursive = TRUE)
 
 # 2. Simulation settings ---------------------------------------------------
 
 num.sims     <- 1000      # number of simulation replicates (one posterior draw each)
-ny           <- 34        # number of projection years
-last.obs.yr  <- 2025      # last observed (brood) year; projections start the year after
+ny           <- 100        # number of projection years
+last.obs.yr  <- 2024      # last observed (brood) year; projections start the year after
 ER           <- 0.20      # fixed exploitation rate
 
 # Stocks (series), in the same order as the series index in the Stan model - PLACEHOLDERS
-stock.names <- c("Stock A", "Stock B", "Stock C")
+stock.names <- unique(sock.brood.covar$Stock)
 n.stocks    <- length(stock.names)
 
 # Standardization used for x1 (spawners), one value per stock - PLACEHOLDERS
@@ -53,14 +53,14 @@ S.sd   <- c(50000, 30000, 15000)
 
 # Row index of the last observed year of each series in the Stan data (y_end)
 # Used to pull the last fitted residual as the starting AR1 state - PLACEHOLDERS
-y.end <- c(30, 60, 90)
+y.end <- read.csv(here(wc.dir, "data/sockeye/stan_start_end.csv"))[,"end"]
 
 # Age-at-return proportions by total age, one row per stock - PLACEHOLDERS
 ages    <- c(4, 5, 6)
 max.age <- max(ages)
 p <- matrix(rep(c(0.3, 0.6, 0.1), each = n.stocks), nrow = n.stocks,
             dimnames = list(stock.names, ages))
-stopifnot(abs(rowSums(p) - 1) < 1e-8)
+stopifnot(abs(rowSums(p) - 1) < 1e-8) # age props sum to zero, with some wiggle room
 
 # Future covariates: flat at 0 (= historical mean, since they were standardized).
 # Replace with a vector of length ny to project a different path.
@@ -76,12 +76,12 @@ init.frac <- 0.5
 #   phi                                   : [draws]
 #   epsilon                               : [draws x N]  (residuals, indexed by data row)
 
-if (file.exists(fit.file)) {
-  fit  <- readRDS(fit.file)
-  post <- rstan::extract(fit, pars = c("alpha", "beta", "gamma", "kappa", "chi",
+if (exists("era.2c")) {
+  post <- rstan::extract(era.2c, pars = c("alpha", "beta", "gamma3", "kappa",
                                        "sigma", "phi", "epsilon"))
+  
 } else {
-  message("'", fit.file, "' not found: using made-up placeholder draws.")
+  message("Stan fit not found: using made-up placeholder draws.")
   n.mock <- 4000
   mock <- function(mu, sd) matrix(rnorm(n.mock * n.stocks, mu, sd), n.mock, n.stocks)
   post <- list(
@@ -103,7 +103,7 @@ eps.last <- post$epsilon[, y.end, drop = FALSE]      # [draws x n_stocks]
 # Take one joint draw for each simulation. The same draw is used for all stocks,
 # which keeps the hierarchical structure and the shared phi intact.
 n.draws  <- nrow(post$alpha)
-draw.idx <- sample(n.draws, num.sims, replace = num.sims > n.draws)
+draw.idx <- sample(n.draws, num.sims, replace = num.sims > n.draws) # Take 1000 joint draws
 
 if (any(post$beta[draw.idx, ] >= 0))
   warning("Some draws have beta >= 0 (no density dependence); equilibrium is set to 0 for those.")
@@ -129,9 +129,8 @@ for (i in 1:num.sims) { # Iteration loop
     
     alpha <- post$alpha[d, s]
     beta  <- post$beta[d, s]
-    gamma <- post$gamma[d, s]
+    gamma <- post$gamma3[d, s] # gamma (SST covar) from most recent time period
     kappa <- post$kappa[d, s]
-    chi   <- post$chi[d, s]
     sigma <- post$sigma[d, s]
     eps   <- eps.last[d, s]       # AR1 state: last fitted residual
     
@@ -144,8 +143,8 @@ for (i in 1:num.sims) { # Iteration loop
     
     for (y in 1:ny) { # Year loop
       
-      # Run returning this year, from recruits of brood years y - age
-      N.fwd[i, s, y] <- sum(R.fwd[i, s, as.character(y - ages)] * p[s, ])
+      # Run returning this year, made up of recruits from various brood years (y - age)
+      N.fwd[i, s, y] <- sum(R.fwd[i, s, as.character(y - ages)] * p[s, ]) # Run for this iteration (i), stock (s), year (y)
       
       # Harvest and escapement
       H.fwd[i, s, y] <- ER * N.fwd[i, s, y]
@@ -154,13 +153,12 @@ for (i in 1:num.sims) { # Iteration loop
       # Standardize spawners to match the x1 used in the model
       x1 <- (S.fwd[i, s, y] - S.mean[s]) / S.sd[s]
       
-      # AR1 process error: no bias correction, matches the mean-zero normal in the Stan model
+      # AR1 process error, matches std normal in the Stan model
       eps <- phi * eps + rnorm(1, 0, sigma)
       
       # Recruits of brood year y produced by this year's spawners
       R.fwd[i, s, as.character(y)] <- S.fwd[i, s, y] *
-        exp(alpha + beta * x1 + gamma * x2.proj[y] + kappa * x3.proj[y] +
-              chi * x2.proj[y] * x3.proj[y] + eps)
+        exp(alpha + beta * x1 + gamma3 * x2.proj[y] + kappa * x3.proj[y] + eps)
     }
   }
 }
